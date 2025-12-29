@@ -3,6 +3,7 @@
 //
 
 #include "sense-voice-decoder.h"
+#include "wenet_ctc_decoder.h"
 
 #define SENSEVOICE_DECODER_MAX_NODES 16
 
@@ -88,6 +89,7 @@ struct ggml_cgraph *sense_voice_build_graph_ctc_decoder(sense_voice_context &ctx
 
 bool sense_voice_decode_internal(sense_voice_context &ctx,
                                  sense_voice_state &state,
+                                 const sense_voice_full_params &params,
                                  const int n_threads) {
     const int64_t t_start_us = ggml_time_us();
 
@@ -117,21 +119,132 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
             return false;
         }
         {
+            // Get output nodes
             ggml_tensor *argmax_logit = ggml_graph_node(gf, ggml_graph_n_nodes(gf) - 1);
-            // TODO 临时处理，建议讨论后取其一
-            if(state.result_all.empty()) {
-                state.ids.resize(argmax_logit->ne[0]);
-                ggml_backend_tensor_get(argmax_logit, state.ids.data(), 0, sizeof(int) * argmax_logit->ne[0]);
+            
+            // Debug: print argmax_logit dimensions
+            SENSE_VOICE_LOG_DEBUG("%s: argmax_logit dims: [%lld, %lld, %lld, %lld]\n",
+                __func__, argmax_logit->ne[0], argmax_logit->ne[1], argmax_logit->ne[2], argmax_logit->ne[3]);
+            
+            // Get probs tensor - it's the first output (before argmax)
+            ggml_tensor *probs = nullptr;
+            for (int i = ggml_graph_n_nodes(gf) - 1; i >= 0; --i) {
+                ggml_tensor *node = ggml_graph_node(gf, i);
+                // Find the 2D probs tensor (reshaped) before argmax
+                if (node != argmax_logit && node->ne[0] > 1000 && node->ne[1] > 1) {
+                    probs = node;
+                    break;
+                }
             }
-            else {
+            
+            if (!probs) {
+                SENSE_VOICE_LOG_ERROR("%s: Could not find probs tensor in graph\n", __func__);
+                return false;
+            }
+            
+            SENSE_VOICE_LOG_DEBUG("%s: probs dims: [%lld, %lld]\n", 
+                __func__, probs->ne[0], probs->ne[1]);
+            
+            // Beam search vs Greedy decoding
+            if (params.strategy == SENSE_VOICE_SAMPLING_BEAM_SEARCH && params.beam_search.beam_size > 1) {
+                // === Beam Search Path ===
+                // probs tensor is 2D: [vocab_size, n_frames] (column-major GGML layout)
+                const int vocab_size = probs->ne[0];  // 25055
+                const int n_frames = probs->ne[1];    // 8256
+                
+                // Validate with model vocab size
+                SENSE_VOICE_LOG_INFO("%s: CTC Beam Search: vocab_size=%d, n_frames=%d, beam_size=%d\n",
+                    __func__, vocab_size, n_frames, params.beam_search.beam_size);
+                
+                // Read probs tensor to CPU
+                std::vector<float> probs_data(vocab_size * n_frames);
+                ggml_backend_tensor_get(probs, probs_data.data(), 0, sizeof(float) * probs_data.size());
+                
+                // Convert to log probabilities and organize by timestep
+                // GGML uses column-major: data[vocab + frame * vocab_size]
+                std::vector<std::vector<float>> log_probs(n_frames);
+                for (int t = 0; t < n_frames; ++t) {
+                    log_probs[t].resize(vocab_size);
+                    for (int v = 0; v < vocab_size; ++v) {
+                        // Column-major access: data[row + col * nrows]
+                        float prob = probs_data[v + t * vocab_size];
+                        log_probs[t][v] = std::log(std::max(prob, 1e-10f));
+                    }
+                }
+                
+                // Run CTC beam search using WeNet decoder
+                wenet_ctc::CtcPrefixBeamSearch decoder(0, params.beam_search.beam_size);
+                for (int t = 0; t < n_frames; ++t) {
+                    decoder.SearchFrame(log_probs[t]);
+                    if (t % 1000 == 0) {
+                        SENSE_VOICE_LOG_INFO("%s: Beam search progress: %d/%d frames (%.1f%%)\n",
+                            __func__, t, n_frames, 100.0f * t / n_frames);
+                    }
+                }
+                
+                auto best_path = decoder.GetBestPath();
+                float best_score = decoder.GetBestScore();
+                
+                SENSE_VOICE_LOG_INFO("%s: Beam search result: %zu tokens, score=%.4f\n",
+                    __func__, best_path.size(), best_score);
+                
+                // Debug: show first 10 tokens
+                if (best_path.size() > 0) {
+                    std::string preview = "First tokens: ";
+                    for (size_t i = 0; i < std::min(size_t(10), best_path.size()); ++i) {
+                        preview += std::to_string(best_path[i]) + " ";
+                    }
+                    SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, preview.c_str());
+                }
+                
+                // Store result
+                if (state.result_all.empty()) {
+                    state.ids = best_path;
+                } else {
+                    // Batch processing - fallback to greedy
+                    state.ids.resize(argmax_logit->ne[0]);
+                    ggml_backend_tensor_get(argmax_logit, state.ids.data(), 0, sizeof(int) * argmax_logit->ne[0]);
+                }
+            } else {
+                // === Greedy Decoding Path (Corrected) ===
+                // 1. Get raw argmax tokens
                 const int32_t n_logits = argmax_logit->ne[0] * argmax_logit->ne[1];
-                // Get the tensor data into a temporary buffer
-                std::vector<int> temp_buffer(n_logits);
-                ggml_backend_tensor_get(argmax_logit, temp_buffer.data(), 0, sizeof(int) * n_logits);
-                for(int32_t i = 0; i < argmax_logit->ne[1]; i++)
-                {
-                    int posL = i * argmax_logit->ne[0];
-                    state.result_all[state.segmentIDs[i]].tokens = std::vector<int>(temp_buffer.begin() + posL, temp_buffer.begin() + posL + argmax_logit->ne[0]);
+                std::vector<int> raw_tokens(n_logits);
+                ggml_backend_tensor_get(argmax_logit, raw_tokens.data(), 0, sizeof(int) * n_logits);
+                
+                // CTC blank token ID (typically 0 in SenseVoice vocab)
+                const int blank_id = 0; 
+
+                // CTC greedy decode: merge repeats and remove blanks
+                auto ctc_greedy_decode = [&](const std::vector<int>& raw, int start, int len) -> std::vector<int> {
+                    std::vector<int> result;
+                    int prev_token = -1;
+                    for (int i = 0; i < len; ++i) {
+                        int curr_token = raw[start + i];
+                        // 1. Merge repeats
+                        if (curr_token != prev_token) {
+                            // 2. Remove blanks
+                            if (curr_token != blank_id) {
+                                result.push_back(curr_token);
+                            }
+                            prev_token = curr_token;
+                        }
+                    }
+                    return result;
+                };
+
+                if(state.result_all.empty()) {
+                    // Single sentence case
+                    state.ids = ctc_greedy_decode(raw_tokens, 0, argmax_logit->ne[0]);
+                }
+                else {
+                    // Batch processing (multiple segments)
+                    for(int32_t i = 0; i < argmax_logit->ne[1]; i++)
+                    {
+                        int posL = i * argmax_logit->ne[0];
+                        state.result_all[state.segmentIDs[i]].tokens = 
+                            ctc_greedy_decode(raw_tokens, posL, argmax_logit->ne[0]);
+                    }
                 }
             }
         }
