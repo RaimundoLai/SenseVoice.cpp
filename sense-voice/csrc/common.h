@@ -13,6 +13,8 @@
 #include <ggml-cpp.h>
 #include <gguf.h>
 #include "sense-voice-frontend.h"
+#include "tokenizers_cpp.h"
+#include <memory>
 
 
 #ifdef __GNUC__
@@ -497,6 +499,7 @@ struct sense_voice_context_params {
     int gpu_device;  // CUDA device
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+    std::string tokenizer_path;
 };
 
 struct sense_voice_context {
@@ -517,6 +520,8 @@ struct sense_voice_context {
     struct sense_voice_state *state = nullptr;
     ggml_backend_t backend = nullptr;
     std::string path_model;
+
+    std::shared_ptr<tokenizers::Tokenizer> tokenizer;
 };
 
 struct sense_voice_full_params sense_voice_full_default_params(enum sense_voice_decoding_strategy strategy);

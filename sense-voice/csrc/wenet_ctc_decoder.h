@@ -162,8 +162,8 @@ public:
                     if (next_ac_state > 0) {
                         int next_depth = contextual_ac_->get_depth(next_ac_state);
                         
-                        if (next_depth > 1) {
-                            // Continuation inside a hotword - give full bonus
+                        if (next_depth >= 1) {
+                            // Continuation inside a hotword OR start of a hotword (important for single-token words)
                             contextual_bonus = contextual_bonus_;
                         }
                         // Note: depth == 1 (new hotword start) gets 0.0 - let acoustic model decide

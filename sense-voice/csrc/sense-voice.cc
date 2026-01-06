@@ -374,6 +374,27 @@ struct sense_voice_context *sense_voice_init_with_params_no_state(
         return nullptr;
     }
 
+    // Load tokenizer if path provided
+    if (!params.tokenizer_path.empty()) {
+        auto LoadBytesFromFile = [](const std::string& path) -> std::string {
+            std::ifstream fs(path, std::ios::in | std::ios::binary);
+            if (!fs) return "";
+            std::string data((std::istreambuf_iterator<char>(fs)), std::istreambuf_iterator<char>());
+            return data;
+        };
+
+        std::string blob = LoadBytesFromFile(params.tokenizer_path);
+        
+        if (!blob.empty()) {
+            ctx->tokenizer = tokenizers::Tokenizer::FromBlobSentencePiece(blob);
+            SENSE_VOICE_LOG_INFO("%s: Loaded tokenizer from %s\n", __func__, params.tokenizer_path.c_str());
+        } else {
+            SENSE_VOICE_LOG_WARN("%s: Warning: Failed to load tokenizer from '%s', check file path. Falling back to greedy.\n", __func__, params.tokenizer_path.c_str());
+        }
+    } else {
+         SENSE_VOICE_LOG_INFO("%s: No tokenizer path provided, using greedy tokenization for hotwords.\n", __func__);
+    }
+
     return ctx;
 }
 

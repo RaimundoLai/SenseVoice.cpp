@@ -7,6 +7,8 @@
 
 #include "common.h"
 #include "sense-voice-encoder.h"
+#include "tokenizers_cpp.h"
+#include <memory>
 
 
 

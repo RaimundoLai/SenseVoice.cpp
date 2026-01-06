@@ -4,6 +4,7 @@
 
 #include "sense-voice-decoder.h"
 #include "wenet_ctc_decoder.h"
+#include "tokenizers_cpp.h"
 #include <set>
 #include <cstring>
 
@@ -267,86 +268,86 @@ static HotWordsAC build_hotwords_ac(
     const sense_voice_full_params& params) {
     HotWordsAC ac;
     
-    // Helper: Check if string looks like English (ASCII letters)
-    auto is_ascii_word = [](const std::string& s) {
-        for (unsigned char c : s) {
-            if (c >= 0x80) return false;  // Non-ASCII = likely Chinese
-        }
-        return true;
-    };
-    
-    // Add hot words (supports per-word score via "word:score" format)
     if (params.hotwords && params.n_hotwords > 0) {
         for (int i = 0; i < params.n_hotwords; ++i) {
             if (params.hotwords[i] && params.hotwords[i][0] != '\0') {
-                // Parse hotword with optional score suffix
+                // 1. Parse score
                 auto parsed = parse_hotword_with_score(params.hotwords[i], params.hotwords_score);
                 const std::string& word = parsed.first;
                 float score = parsed.second;
                 
-                // Tokenize the original word
-                auto tokens = greedy_tokenize(ctx.vocab, word);
-                
-                std::string debug_str = "Hotword '" + word + "' (score=" + std::to_string(score) + ") -> tokens: ";
-                for (int id : tokens) {
-                    auto it = ctx.vocab.id_to_token.find(id);
-                    if (it != ctx.vocab.id_to_token.end()) {
-                        debug_str += "[" + std::to_string(id) + ":" + it->second + "] ";
-                    }
-                }
-                if (params.debug_mode) {
-                    SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
-                }
-                
-                // Only skip very short single-token hotwords (< 3 chars) that cause interference
-                // English words like "Apple", "Google" are often single tokens and should NOT be skipped
-                bool is_short_single_token = (tokens.size() == 1 && word.length() < 3);
-                
-                if (!is_short_single_token && !tokens.empty()) {
-                    ac.insert(tokens, score);
+                std::vector<int> tokens;
+
+                // 2. Use Tokenizer if available
+                if (ctx.tokenizer) {
+                    // Use loaded tokenizer (SentencePiece/BPE)
+                    tokens = ctx.tokenizer->Encode(word);
                     
-                    // For English words: add space-prefixed versions
-                    // This handles mid-sentence occurrences where tokens have leading space
-                    if (is_ascii_word(word)) {
-                        // Try 1: ASCII Space (0x20) - some tokenizers use this
-                        std::string space_word_ascii = " " + word;
-                        auto tokens_ascii = greedy_tokenize(ctx.vocab, space_word_ascii);
-                        if (!tokens_ascii.empty() && tokens_ascii != tokens) {
-                            ac.insert(tokens_ascii, score);
-                            debug_str = "  + ASCII space variant: ";
-                            for (int id : tokens_ascii) {
-                                auto it = ctx.vocab.id_to_token.find(id);
-                                if (it != ctx.vocab.id_to_token.end()) {
-                                    debug_str += "[" + std::to_string(id) + ":" + it->second + "] ";
-                                }
-                            }
-                            if (params.debug_mode) {
-                                SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
-                            }
-                        }
-                        
-                        // Try 2: SentencePiece Space (U+2581 = \xe2\x96\x81) - SenseVoice uses this
-                        std::string space_word_sp = "\xe2\x96\x81" + word;
-                        auto tokens_sp = greedy_tokenize(ctx.vocab, space_word_sp);
-                        if (!tokens_sp.empty() && tokens_sp != tokens && tokens_sp != tokens_ascii) {
-                            ac.insert(tokens_sp, score);
-                            debug_str = "  + SentencePiece space variant: ";
-                            for (int id : tokens_sp) {
-                                auto it = ctx.vocab.id_to_token.find(id);
-                                if (it != ctx.vocab.id_to_token.end()) {
-                                    debug_str += "[" + std::to_string(id) + ":" + it->second + "] ";
-                                }
-                            }
-                            if (params.debug_mode) {
-                                SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
-                            }
-                        }
-                    }
-                } else if (is_short_single_token) {
                     if (params.debug_mode) {
-                        SENSE_VOICE_LOG_INFO("%s: Skipping short hotword '%s' (< 3 chars, causes interference)\n",
-                            __func__, word.c_str());
+                        std::string debug_str = "Hotword '" + word + "' (score=" + std::to_string(score) + ") -> tokens: ";
+                        for (int id : tokens) debug_str += std::to_string(id) + " ";
+                        SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
                     }
+
+                    std::string capitalized_word = word;
+                    if (!capitalized_word.empty() && islower(capitalized_word[0])) {
+                        capitalized_word[0] = toupper(capitalized_word[0]);
+                        std::vector<int> tokens_cap = ctx.tokenizer->Encode(capitalized_word);
+                        
+                        if (!tokens_cap.empty() && tokens_cap != tokens) {
+                            ac.insert(tokens_cap, score);
+                            if (params.debug_mode) {
+                                std::string debug_str = "  + Cap variant: ";
+                                for (int id : tokens_cap) debug_str += std::to_string(id) + " ";
+                                SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
+                            }
+                        }
+                    }
+
+                    // 3. Handle Space Prefix variant (e.g. for English mid-sentence mapping)
+                    std::string word_with_space = " " + word;
+                    // Try space prefix
+                    std::vector<int> tokens_space = ctx.tokenizer->Encode(word_with_space);
+                    
+                    if (!tokens_space.empty() && tokens_space != tokens) {
+                        ac.insert(tokens_space, score);
+                        if (params.debug_mode) {
+                            std::string debug_str = "  + Space variant: ";
+                            for (int id : tokens_space) debug_str += std::to_string(id) + " ";
+                            SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
+                        }
+                    }
+                    
+                    // Also try SentencePiece specific space character just in case (U+2581)
+                    // \xe2\x96\x81 is UTF-8 for U+2581
+                     std::string word_with_sp_space = "\xe2\x96\x81" + word;
+                     std::vector<int> tokens_sp_space = ctx.tokenizer->Encode(word_with_sp_space);
+                     if (!tokens_sp_space.empty() && tokens_sp_space != tokens && tokens_sp_space != tokens_space) {
+                        ac.insert(tokens_sp_space, score);
+                        if (params.debug_mode) {
+                             std::string debug_str = "  + SP Space variant: ";
+                             for (int id : tokens_sp_space) debug_str += std::to_string(id) + " ";
+                             SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
+                        }
+                     }
+
+                } else {
+                    // Fallback: greedy_tokenize
+                    if (params.debug_mode) {
+                         SENSE_VOICE_LOG_INFO("%s: Warning - No tokenizer loaded, falling back to greedy for '%s'\n", __func__, word.c_str());
+                    }
+                    tokens = greedy_tokenize(ctx.vocab, word);
+                    
+                    if (params.debug_mode) {
+                        std::string debug_str = "Greedy tokens: ";
+                        for (int id : tokens) debug_str += std::to_string(id) + " ";
+                        SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
+                    }
+                }
+
+                // 4. Insert into AC
+                if (!tokens.empty()) {
+                    ac.insert(tokens, score);
                 }
             }
         }
