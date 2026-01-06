@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <set>
 
 namespace wenet_ctc {
 
@@ -49,6 +50,10 @@ inline void TopK(const std::vector<float>& data, int k,
     }
 }
 
+// Forward declaration
+struct ACNode;
+class HotWordsAC;
+
 struct PrefixScore {
     float s = -kFloatMax;       // blank ending score
     float ns = -kFloatMax;      // non-blank ending score
@@ -57,6 +62,9 @@ struct PrefixScore {
     float cur_token_prob = -kFloatMax;
     std::vector<int> times_s;   // times of viterbi blank path
     std::vector<int> times_ns;  // times of viterbi non-blank path
+    
+    // Contextual hot word state tracking
+    int ac_state = 0;           // Current state in AC automaton
     
     float score() const { return LogAdd(s, ns); }
     float viterbi_score() const { return v_s > v_ns ? v_s : v_ns; }
@@ -75,11 +83,36 @@ struct PrefixHash {
     }
 };
 
+// AC Node structure (minimal, for interface)
+struct ACNodeInterface {
+    std::unordered_map<int, int> children;
+    int fail = 0;
+    float output = 0.0f;
+    bool is_end = false;
+};
+
+// Hot Words AC Interface for contextual biasing
+class HotWordsACInterface {
+public:
+    virtual ~HotWordsACInterface() = default;
+    virtual std::pair<int, float> step(int state, int token_id) const = 0;
+    virtual bool empty() const = 0;
+    virtual std::set<int> get_bonus_tokens(int state) const = 0;
+    virtual int get_depth(int state) const = 0;  // Get depth of state in trie
+    virtual bool is_end(int state) const = 0;    // Check if state is hotword ending
+};
+
 class CtcPrefixBeamSearch {
 public:
     CtcPrefixBeamSearch(int blank_id, int beam_size)
         : blank_id_(blank_id), beam_size_(beam_size) {
         Reset();
+    }
+    
+    // Set AC automaton for contextual hot word biasing
+    void SetContextualAC(const HotWordsACInterface* ac, float contextual_bonus) {
+        contextual_ac_ = ac;
+        contextual_bonus_ = contextual_bonus;
     }
     
     void Reset() {
@@ -91,12 +124,13 @@ public:
         prefix_score.ns = -kFloatMax;
         prefix_score.v_s = 0.0;
         prefix_score.v_ns = 0.0;
+        prefix_score.ac_state = 0;  // Start at root of AC
         
         std::vector<int> empty;
         cur_hyps_[empty] = prefix_score;
     }
     
-    // Search one frame
+    // Search one frame with contextual hot word biasing
     void SearchFrame(const std::vector<float>& logp_t) {
         std::unordered_map<std::vector<int>, PrefixScore, PrefixHash> next_hyps;
         
@@ -115,12 +149,46 @@ public:
                 const std::vector<int>& prefix = it.first;
                 const PrefixScore& prefix_score = it.second;
                 
+                // Calculate contextual hot word bonus
+                float contextual_bonus = 0.0f;
+                int next_ac_state = prefix_score.ac_state;
+                
+                if (id != blank_id_ && contextual_ac_ && !contextual_ac_->empty()) {
+                    auto ac_result = contextual_ac_->step(prefix_score.ac_state, id);
+                    next_ac_state = ac_result.first;
+                    float completion_bonus = ac_result.second;
+                    
+                    // Simple contextual biasing: only give bonus for continuation and completion
+                    if (next_ac_state > 0) {
+                        int next_depth = contextual_ac_->get_depth(next_ac_state);
+                        
+                        if (next_depth > 1) {
+                            // Continuation inside a hotword - give full bonus
+                            contextual_bonus = contextual_bonus_;
+                        }
+                        // Note: depth == 1 (new hotword start) gets 0.0 - let acoustic model decide
+                        
+                        // Add completion bonus when hotword is fully matched
+                        if (completion_bonus > 0) {
+                            contextual_bonus += completion_bonus;
+                            // RESET AC state to 0 after hotword completion
+                            // This prevents failure links from causing ghost repetitions
+                            // (e.g., nonsense -> ense, check -> ck)
+                            next_ac_state = 0;
+                        }
+                    }
+                }
+
                 if (id == blank_id_) {
-                    // Case 0: *a + blank => *a
+                    // Standard blank handling - no special boosting
                     PrefixScore& next_score = next_hyps[prefix];
                     next_score.s = LogAdd(next_score.s, prefix_score.score() + prob);
                     next_score.v_s = prefix_score.viterbi_score() + prob;
                     next_score.times_s = prefix_score.times();
+                    // Blank doesn't change AC state
+                    if (next_score.ac_state == 0) {
+                        next_score.ac_state = prefix_score.ac_state;
+                    }
                 } else if (!prefix.empty() && id == prefix.back()) {
                     // Case 1: *a + a => *a (merge)
                     PrefixScore& next_score1 = next_hyps[prefix];
@@ -135,30 +203,40 @@ public:
                             }
                         }
                     }
+                    // Merge doesn't change AC state
+                    if (next_score1.ac_state == 0) {
+                        next_score1.ac_state = prefix_score.ac_state;
+                    }
                     
                     // Case 2: *a[blank] + a => *aa (extend after blank)
                     std::vector<int> new_prefix(prefix);
                     new_prefix.push_back(id);
                     PrefixScore& next_score2 = next_hyps[new_prefix];
-                    next_score2.ns = LogAdd(next_score2.ns, prefix_score.s + prob);
-                    if (next_score2.v_ns < prefix_score.v_s + prob) {
-                        next_score2.v_ns = prefix_score.v_s + prob;
+                    float total_prob = prefix_score.s + prob + contextual_bonus;
+                    next_score2.ns = LogAdd(next_score2.ns, total_prob);
+                    if (next_score2.v_ns < total_prob) {
+                        next_score2.v_ns = total_prob;
                         next_score2.cur_token_prob = prob;
                         next_score2.times_ns = prefix_score.times_s;
                         next_score2.times_ns.push_back(abs_time_step_);
                     }
+                    // Update AC state
+                    next_score2.ac_state = next_ac_state;
                 } else {
                     // Case 3: *a + b => *ab (new character)
                     std::vector<int> new_prefix(prefix);
                     new_prefix.push_back(id);
                     PrefixScore& next_score = next_hyps[new_prefix];
-                    next_score.ns = LogAdd(next_score.ns, prefix_score.score() + prob);
-                    if (next_score.v_ns < prefix_score.viterbi_score() + prob) {
-                        next_score.v_ns = prefix_score.viterbi_score() + prob;
+                    float total_prob = prefix_score.score() + prob + contextual_bonus;
+                    next_score.ns = LogAdd(next_score.ns, total_prob);
+                    if (next_score.v_ns < total_prob) {
+                        next_score.v_ns = total_prob;
                         next_score.cur_token_prob = prob;
                         next_score.times_ns = prefix_score.times();
                         next_score.times_ns.push_back(abs_time_step_);
                     }
+                    // Update AC state
+                    next_score.ac_state = next_ac_state;
                 }
             }
         }
@@ -221,6 +299,8 @@ private:
     int blank_id_;
     int beam_size_;
     int abs_time_step_ = 0;
+    const HotWordsACInterface* contextual_ac_ = nullptr;
+    float contextual_bonus_ = 0.0f;
     std::unordered_map<std::vector<int>, PrefixScore, PrefixHash> cur_hyps_;
 };
 

@@ -74,6 +74,10 @@ struct sense_voice_full_params sense_voice_full_default_params(enum sense_voice_
                     /*.beam_size =*/ -1,
             },
 
+            /*.hotwords          =*/ nullptr,
+            /*.n_hotwords        =*/ 0,
+            /*.hotwords_score    =*/ 3.0f,
+
             /*.progress_callback           =*/ nullptr,
             /*.progress_callback_user_data =*/ nullptr,
 

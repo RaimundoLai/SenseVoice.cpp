@@ -4,8 +4,366 @@
 
 #include "sense-voice-decoder.h"
 #include "wenet_ctc_decoder.h"
+#include <set>
+#include <cstring>
 
 #define SENSEVOICE_DECODER_MAX_NODES 16
+
+// ============================================================================
+// Hot Words Biasing using Aho-Corasick Automaton
+// ============================================================================
+// The Aho-Corasick algorithm builds a trie of all hot word token sequences
+// and uses failure links to efficiently match multiple patterns simultaneously.
+// During CTC beam search, we track the automaton state as tokens are decoded
+// and boost log probabilities of tokens that continue hot word prefixes.
+// ============================================================================
+
+#include <queue>
+#include <unordered_map>
+
+// Aho-Corasick Automaton Node
+struct ACNode {
+    std::unordered_map<int, int> children;  // token_id -> child node index
+    int fail = 0;           // failure link (index into nodes vector)
+    float output = 0.0f;    // accumulated score when reaching this node (word ends here)
+    bool is_end = false;    // true if a hot word pattern ends at this node
+    int depth = 0;          // depth in trie (0 = root, 1 = first token, etc.)
+};
+
+// Aho-Corasick Automaton for hot words token sequences
+class HotWordsAC {
+public:
+    std::vector<ACNode> nodes;
+    
+    HotWordsAC() {
+        nodes.emplace_back();  // root node at index 0
+    }
+    
+    // Insert a hot word token sequence into the trie
+    void insert(const std::vector<int>& pattern, float score) {
+        if (pattern.empty()) return;
+        
+        int cur = 0;  // start at root
+        for (int token_id : pattern) {
+            auto it = nodes[cur].children.find(token_id);
+            if (it == nodes[cur].children.end()) {
+                int new_node = static_cast<int>(nodes.size());
+                nodes.emplace_back();
+                nodes[cur].children[token_id] = new_node;
+                // Calculate depth: parent depth + 1
+                nodes[new_node].depth = nodes[cur].depth + 1;
+                cur = new_node;
+            } else {
+                cur = it->second;
+            }
+        }
+        nodes[cur].is_end = true;
+        nodes[cur].output += score;  // accumulate if multiple patterns end here
+    }
+    
+    // Build failure links using BFS
+    void build() {
+        std::queue<int> q;
+        
+        // Initialize: children of root have failure link to root
+        for (auto it = nodes[0].children.begin(); it != nodes[0].children.end(); ++it) {
+            int child = it->second;
+            nodes[child].fail = 0;
+            q.push(child);
+        }
+        
+        // BFS to build failure links
+        while (!q.empty()) {
+            int cur = q.front();
+            q.pop();
+            
+            for (auto it = nodes[cur].children.begin(); it != nodes[cur].children.end(); ++it) {
+                int token_id = it->first;
+                int child = it->second;
+                // Find failure link for child
+                int f = nodes[cur].fail;
+                while (f != 0 && nodes[f].children.find(token_id) == nodes[f].children.end()) {
+                    f = nodes[f].fail;
+                }
+                
+                auto fit = nodes[f].children.find(token_id);
+                if (fit != nodes[f].children.end() && fit->second != child) {
+                    nodes[child].fail = fit->second;
+                } else {
+                    nodes[child].fail = 0;
+                }
+                
+                // Accumulate output from failure chain
+                nodes[child].output += nodes[nodes[child].fail].output;
+                
+                q.push(child);
+            }
+        }
+    }
+    
+    // Given current state, transition on token_id and return (new_state, bonus_score)
+    std::pair<int, float> step(int state, int token_id) const {
+        int cur = state;
+        
+        // Follow failure links until we find a transition or reach root
+        while (cur != 0 && nodes[cur].children.find(token_id) == nodes[cur].children.end()) {
+            cur = nodes[cur].fail;
+        }
+        
+        auto it = nodes[cur].children.find(token_id);
+        if (it != nodes[cur].children.end()) {
+            int next = it->second;
+            return {next, nodes[next].output};
+        }
+        
+        return {0, 0.0f};  // stay at root, no bonus
+    }
+    
+    // Get tokens that would give a bonus from this state
+    std::set<int> get_bonus_tokens(int state) const {
+        std::set<int> result;
+        
+        // Collect all possible transitions from current state (including via failure links)
+        int cur = state;
+        while (true) {
+            for (auto it = nodes[cur].children.begin(); it != nodes[cur].children.end(); ++it) {
+                result.insert(it->first);
+            }
+            if (cur == 0) break;
+            cur = nodes[cur].fail;
+        }
+        
+        return result;
+    }
+    
+    // Get depth of a state (0 = root, 1 = first token, etc.)
+    int get_depth(int state) const {
+        if (state >= 0 && state < static_cast<int>(nodes.size())) {
+            return nodes[state].depth;
+        }
+        return 0;
+    }
+    
+    // Check if a state is the end of a hot word
+    bool is_end(int state) const {
+        if (state >= 0 && state < static_cast<int>(nodes.size())) {
+            return nodes[state].is_end;
+        }
+        return false;
+    }
+    
+    bool empty() const { return nodes.size() <= 1; }
+};
+
+// Adapter to make HotWordsAC compatible with wenet_ctc::HotWordsACInterface
+class HotWordsACAdapter : public wenet_ctc::HotWordsACInterface {
+public:
+    explicit HotWordsACAdapter(const HotWordsAC* ac) : ac_(ac) {}
+    
+    std::pair<int, float> step(int state, int token_id) const override {
+        return ac_->step(state, token_id);
+    }
+    
+    bool empty() const override {
+        return ac_->empty();
+    }
+    
+    std::set<int> get_bonus_tokens(int state) const override {
+        return ac_->get_bonus_tokens(state);
+    }
+    
+    int get_depth(int state) const override {
+        return ac_->get_depth(state);
+    }
+    
+    bool is_end(int state) const override {
+        return ac_->is_end(state);
+    }
+    
+private:
+    const HotWordsAC* ac_;
+};
+
+// Greedy tokenization: tokenize text using longest-match greedy approach
+static std::vector<int> greedy_tokenize(
+    const sense_voice_vocab& vocab,
+    const std::string& text) {
+    std::vector<int> result;
+    if (text.empty()) return result;
+    
+    size_t pos = 0;
+    while (pos < text.size()) {
+        int best_id = -1;
+        size_t best_len = 0;
+        
+        for (const auto& pair : vocab.token_to_id) {
+            const std::string& token = pair.first;
+            if (token.empty()) continue;
+            
+            if (pos + token.size() <= text.size() &&
+                text.compare(pos, token.size(), token) == 0) {
+                if (token.size() > best_len) {
+                    best_len = token.size();
+                    best_id = pair.second;
+                }
+            }
+        }
+        
+        if (best_id >= 0) {
+            result.push_back(best_id);
+            pos += best_len;
+        } else {
+            unsigned char c = text[pos];
+            if ((c & 0x80) == 0) pos += 1;
+            else if ((c & 0xE0) == 0xC0) pos += 2;
+            else if ((c & 0xF0) == 0xE0) pos += 3;
+            else if ((c & 0xF8) == 0xF0) pos += 4;
+            else pos += 1;
+        }
+    }
+    
+    return result;
+}
+
+// Parse hotword with optional score suffix
+// Format: "word" or "word:5.0" where 5.0 is the individual score
+// Returns (word_without_suffix, score)
+static std::pair<std::string, float> parse_hotword_with_score(const char* hotword, float default_score) {
+    std::string hw_str(hotword);
+    float score = default_score;
+    
+    // Find the last ':' that could be a score separator
+    size_t colon_pos = hw_str.rfind(':');
+    if (colon_pos != std::string::npos && colon_pos > 0 && colon_pos < hw_str.size() - 1) {
+        // Check if everything after ':' is a valid number
+        std::string suffix = hw_str.substr(colon_pos + 1);
+        bool is_number = true;
+        bool has_dot = false;
+        for (size_t i = 0; i < suffix.size(); ++i) {
+            char c = suffix[i];
+            if (c == '.') {
+                if (has_dot) { is_number = false; break; }
+                has_dot = true;
+            } else if (c == '-' && i == 0) {
+                // Allow negative at start
+            } else if (!isdigit(c)) {
+                is_number = false;
+                break;
+            }
+        }
+        
+        if (is_number && !suffix.empty()) {
+            score = static_cast<float>(atof(suffix.c_str()));
+            hw_str = hw_str.substr(0, colon_pos);
+        }
+    }
+    
+    return std::make_pair(hw_str, score);
+}
+
+// Build Aho-Corasick automaton from hot words
+static HotWordsAC build_hotwords_ac(
+    const sense_voice_context& ctx,
+    const sense_voice_full_params& params) {
+    HotWordsAC ac;
+    
+    // Helper: Check if string looks like English (ASCII letters)
+    auto is_ascii_word = [](const std::string& s) {
+        for (unsigned char c : s) {
+            if (c >= 0x80) return false;  // Non-ASCII = likely Chinese
+        }
+        return true;
+    };
+    
+    // Add hot words (supports per-word score via "word:score" format)
+    if (params.hotwords && params.n_hotwords > 0) {
+        for (int i = 0; i < params.n_hotwords; ++i) {
+            if (params.hotwords[i] && params.hotwords[i][0] != '\0') {
+                // Parse hotword with optional score suffix
+                auto parsed = parse_hotword_with_score(params.hotwords[i], params.hotwords_score);
+                const std::string& word = parsed.first;
+                float score = parsed.second;
+                
+                // Tokenize the original word
+                auto tokens = greedy_tokenize(ctx.vocab, word);
+                
+                std::string debug_str = "Hotword '" + word + "' (score=" + std::to_string(score) + ") -> tokens: ";
+                for (int id : tokens) {
+                    auto it = ctx.vocab.id_to_token.find(id);
+                    if (it != ctx.vocab.id_to_token.end()) {
+                        debug_str += "[" + std::to_string(id) + ":" + it->second + "] ";
+                    }
+                }
+                if (params.debug_mode) {
+                    SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
+                }
+                
+                // Only skip very short single-token hotwords (< 3 chars) that cause interference
+                // English words like "Apple", "Google" are often single tokens and should NOT be skipped
+                bool is_short_single_token = (tokens.size() == 1 && word.length() < 3);
+                
+                if (!is_short_single_token && !tokens.empty()) {
+                    ac.insert(tokens, score);
+                    
+                    // For English words: add space-prefixed versions
+                    // This handles mid-sentence occurrences where tokens have leading space
+                    if (is_ascii_word(word)) {
+                        // Try 1: ASCII Space (0x20) - some tokenizers use this
+                        std::string space_word_ascii = " " + word;
+                        auto tokens_ascii = greedy_tokenize(ctx.vocab, space_word_ascii);
+                        if (!tokens_ascii.empty() && tokens_ascii != tokens) {
+                            ac.insert(tokens_ascii, score);
+                            debug_str = "  + ASCII space variant: ";
+                            for (int id : tokens_ascii) {
+                                auto it = ctx.vocab.id_to_token.find(id);
+                                if (it != ctx.vocab.id_to_token.end()) {
+                                    debug_str += "[" + std::to_string(id) + ":" + it->second + "] ";
+                                }
+                            }
+                            if (params.debug_mode) {
+                                SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
+                            }
+                        }
+                        
+                        // Try 2: SentencePiece Space (U+2581 = \xe2\x96\x81) - SenseVoice uses this
+                        std::string space_word_sp = "\xe2\x96\x81" + word;
+                        auto tokens_sp = greedy_tokenize(ctx.vocab, space_word_sp);
+                        if (!tokens_sp.empty() && tokens_sp != tokens && tokens_sp != tokens_ascii) {
+                            ac.insert(tokens_sp, score);
+                            debug_str = "  + SentencePiece space variant: ";
+                            for (int id : tokens_sp) {
+                                auto it = ctx.vocab.id_to_token.find(id);
+                                if (it != ctx.vocab.id_to_token.end()) {
+                                    debug_str += "[" + std::to_string(id) + ":" + it->second + "] ";
+                                }
+                            }
+                            if (params.debug_mode) {
+                                SENSE_VOICE_LOG_INFO("%s: %s\n", __func__, debug_str.c_str());
+                            }
+                        }
+                    }
+                } else if (is_short_single_token) {
+                    if (params.debug_mode) {
+                        SENSE_VOICE_LOG_INFO("%s: Skipping short hotword '%s' (< 3 chars, causes interference)\n",
+                            __func__, word.c_str());
+                    }
+                }
+            }
+        }
+    }
+    
+    if (!ac.empty()) {
+        ac.build();
+        if (params.debug_mode) {
+            SENSE_VOICE_LOG_INFO("%s: Built Aho-Corasick automaton with %zu nodes\n", 
+                __func__, ac.nodes.size());
+        }
+    }
+    
+    return ac;
+}
+
+
 
 // faster matrix multiplications for tensors that do not have dimension 0 divisible by "pad"
 // the idea is to represent the original matrix multiplication:
@@ -172,11 +530,32 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
                     }
                 }
                 
-                // Run CTC beam search using WeNet decoder
+                // Apply hot words biasing using Aho-Corasick (if configured)
+                HotWordsAC hotwords_ac = build_hotwords_ac(ctx, params);
+                
+                // NOTE: Static biasing removed - it corrupts English BPE output
+                // We now rely entirely on contextual tracking during beam search
+                
+                // Create adapter for contextual biasing in beam search
+                HotWordsACAdapter ac_adapter(&hotwords_ac);
+                
+                // Run CTC beam search using WeNet decoder with contextual hot word biasing
                 wenet_ctc::CtcPrefixBeamSearch decoder(0, params.beam_search.beam_size);
+                
+                // Enable contextual biasing: track AC state and give progressive bonus
+                // when tokens follow the hot word sequence
+                if (!hotwords_ac.empty() && params.hotwords_score != 0.0f) {
+                    float contextual_bonus = params.hotwords_score * 0.5f;  // 50% bonus for being on path
+                    decoder.SetContextualAC(&ac_adapter, contextual_bonus);
+                    if (params.debug_mode) {
+                        SENSE_VOICE_LOG_INFO("%s: Enabled contextual hot word biasing (bonus=%.2f)\n",
+                            __func__, contextual_bonus);
+                    }
+                }
+                
                 for (int t = 0; t < n_frames; ++t) {
                     decoder.SearchFrame(log_probs[t]);
-                    if (t % 1000 == 0) {
+                    if (params.debug_mode && t % 1000 == 0) {
                         SENSE_VOICE_LOG_INFO("%s: Beam search progress: %d/%d frames (%.1f%%)\n",
                             __func__, t, n_frames, 100.0f * t / n_frames);
                     }
@@ -189,7 +568,7 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
                     __func__, best_path.size(), best_score);
                 
                 // Debug: show first 10 tokens
-                if (best_path.size() > 0) {
+                if (params.debug_mode && best_path.size() > 0) {
                     std::string preview = "First tokens: ";
                     for (size_t i = 0; i < std::min(size_t(10), best_path.size()); ++i) {
                         preview += std::to_string(best_path[i]) + " ";

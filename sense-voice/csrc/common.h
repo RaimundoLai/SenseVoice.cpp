@@ -460,6 +460,12 @@ struct sense_voice_full_params {
         int beam_size;
     } beam_search;
 
+    // Hot words biasing parameters (for CTC token probability boosting)
+    // Note: These only take effect when using beam search decoding
+    const char ** hotwords;           // Array of hot word strings to boost
+    int n_hotwords;                   // Number of hot words in the array
+    float hotwords_score;             // Log probability bonus for hot word tokens (default: 1.0)
+
     // called on each progress update
     sense_voice_progress_callback progress_callback;
     void *progress_callback_user_data;
