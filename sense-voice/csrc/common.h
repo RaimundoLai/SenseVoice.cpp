@@ -499,7 +499,6 @@ struct sense_voice_context_params {
     int gpu_device;  // CUDA device
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
-    std::string tokenizer_path;
 };
 
 struct sense_voice_context {
