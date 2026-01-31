@@ -3,14 +3,16 @@
 //
 #include "sense-voice.h"
 #include "common.h"
+#include "sense-voice-bpe-data.h"
 #include "sense-voice-cmvn.h"
 #include "sense-voice-decoder.h"
 #include "sense-voice-encoder.h"
-#include "sense-voice-bpe-data.h"
 #include "silero-vad.h"
 #include <cassert>
 #include <functional>
 #include <thread>
+#include <sys/stat.h> // for stat
+
 
 #define SENSE_VOICE_MAX_NODES 8192
 #define SENSE_VOICE_MAX_DECODERS 8
@@ -90,11 +92,11 @@ bool sense_voice_model_load(const char *path_model, sense_voice_context &sctx) {
     // kv data
     {
         SENSE_VOICE_LOG_INFO("%s: version:      %d\n", __func__,
-                            gguf_get_version(gguf_ctx));
+                             gguf_get_version(gguf_ctx));
         SENSE_VOICE_LOG_INFO("%s: alignment:   %zu\n", __func__,
-                            gguf_get_alignment(gguf_ctx));
+                             gguf_get_alignment(gguf_ctx));
         SENSE_VOICE_LOG_INFO("%s: data offset: %zu\n", __func__,
-                            gguf_get_data_offset(gguf_ctx));
+                             gguf_get_data_offset(gguf_ctx));
 
         const int n_kv = gguf_get_n_kv(gguf_ctx);
 
@@ -376,7 +378,7 @@ struct sense_voice_context *sense_voice_init_with_params_no_state(
     }
 
     // Load embedded BPE tokenizer
-    std::string embedded_blob(reinterpret_cast<const char*>(SENSE_VOICE_BPE_DATA), SENSE_VOICE_BPE_DATA_LENGTH);
+    std::string embedded_blob(reinterpret_cast<const char *>(SENSE_VOICE_BPE_DATA), SENSE_VOICE_BPE_DATA_LENGTH);
     ctx->tokenizer = tokenizers::Tokenizer::FromBlobSentencePiece(embedded_blob);
     SENSE_VOICE_LOG_INFO("%s: Loaded embedded BPE tokenizer\n", __func__);
 
@@ -551,9 +553,86 @@ static size_t sense_voice_sched_size(struct sense_voice_sched &sched) {
     return size;
 }
 
+struct sense_voice_state *sense_voice_init_state(sense_voice_context *ctx);
+
+
+
 struct sense_voice_state *sense_voice_init_state(sense_voice_context *ctx) {
     ctx->state = new sense_voice_state;
     auto state = ctx->state;
+
+#ifdef SENSE_VOICE_USE_COREML
+    #pragma message("SENSE_VOICE_USE_COREML is defined during compilation!")
+    SENSE_VOICE_LOG_INFO("%s: SENSE_VOICE_USE_COREML is DEFINED\n", __func__);
+    std::string path_bin = ctx->path_model;
+    std::string path_coreml = "";
+#else
+    #pragma message("SENSE_VOICE_USE_COREML is NOT defined during compilation!")
+    SENSE_VOICE_LOG_INFO("%s: SENSE_VOICE_USE_COREML is NOT DEFINED\n", __func__);
+#endif
+
+#ifdef SENSE_VOICE_USE_COREML
+    // Priority 1: Replace .bin with -encoder.mlmodelc (Keep q8_0 or other tags)
+    // e.g. model-q8_0.bin -> model-q8_0-encoder.mlmodelc
+    std::string path_p1 = path_bin;
+    size_t pos_ext = path_p1.rfind('.');
+    if (pos_ext != std::string::npos) {
+        path_p1.replace(pos_ext, std::string::npos, "-encoder.mlmodelc");
+    } else {
+        path_p1 += "-encoder.mlmodelc";
+    }
+
+    struct stat buffer;
+    
+    // Debug logging for path resolution
+    SENSE_VOICE_LOG_INFO("%s: checking for CoreML model at '%s'\n", __func__, path_p1.c_str());
+    
+    if (stat(path_p1.c_str(), &buffer) == 0) {
+        path_coreml = path_p1;
+    } else {
+        // Priority 2: Replace last '-' with -encoder.mlmodelc (Strip q8_0)
+        // e.g. model-q8_0.bin -> model-encoder.mlmodelc
+        // or model-q8_0 -> model-encoder.mlmodelc
+        
+        std::string path_p2 = path_bin;
+        
+        // Remove extension first if present
+        if (pos_ext != std::string::npos) {
+             path_p2 = path_p2.substr(0, pos_ext);
+        }
+        
+        // Find last '-'
+        size_t pos_hyphen = path_p2.rfind('-');
+        if (pos_hyphen != std::string::npos) {
+            path_p2.replace(pos_hyphen, std::string::npos, "-encoder.mlmodelc");
+             
+             SENSE_VOICE_LOG_INFO("%s: checking for fallback CoreML model at '%s'\n", __func__, path_p2.c_str());
+             
+             if (stat(path_p2.c_str(), &buffer) == 0) {
+                 path_coreml = path_p2;
+             }
+        }
+    }
+
+    if (path_coreml.empty()) {
+        // Fallback to old behavior if neither found?
+        // Or just use P1 as default for error reporting
+        path_coreml = path_p1;
+        SENSE_VOICE_LOG_INFO("%s: CoreML model not found, default to '%s'\n", __func__, path_coreml.c_str());
+    }
+
+    // std::ifstream fin(path_coreml); // invalid for directories
+    if (stat(path_coreml.c_str(), &buffer) == 0) {
+        SENSE_VOICE_LOG_INFO("%s: loading CoreML model from '%s'\n", __func__, path_coreml.c_str());
+        state->ctx_coreml = sense_voice_coreml_init(path_coreml.c_str());
+        if (state->ctx_coreml) {
+            SENSE_VOICE_LOG_INFO("%s: CoreML model loaded\n", __func__);
+        } else {
+            SENSE_VOICE_LOG_ERROR("%s: failed to load CoreML model\n", __func__);
+        }
+    }
+#endif
+
     state->backends = sense_voice_backend_init(ctx->params);
     if (state->backends.empty()) {
         SENSE_VOICE_LOG_ERROR("%s: sense_voice_backend_init() failed\n", __func__);
@@ -703,7 +782,7 @@ int sense_voice_pcm_to_feature_with_state(struct sense_voice_context *ctx,
             state->feature.buffer = nullptr;
         }
         state->feature.tensor = nullptr;
-        
+
         // init features
         state->feature.n_len = state->feature.data.size() / (state->feature.n_mel * state->feature.lfr_m);
         state->feature.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
@@ -814,10 +893,9 @@ int sense_voice_batch_pcm_to_feature_with_state(struct sense_voice_context *ctx,
     size_t max_len = 0;
     for (size_t segmentID: state->segmentIDs)
         max_len = std::max(max_len, state->result_all[segmentID].samples.size());
-    for (size_t segmentID: state->segmentIDs)
-    {
-        std::vector<float>& pcmf32 = state->result_all[segmentID].samples;
-        if(pcmf32.size() < max_len) {
+    for (size_t segmentID: state->segmentIDs) {
+        std::vector<float> &pcmf32 = state->result_all[segmentID].samples;
+        if (pcmf32.size() < max_len) {
             pcmf32.insert(pcmf32.end(), max_len - pcmf32.size(), 0);
         }
         // 这里实际上可以const。
@@ -843,7 +921,7 @@ int sense_voice_batch_pcm_to_feature_with_state(struct sense_voice_context *ctx,
             state->feature.buffer = nullptr;
         }
         state->feature.tensor = nullptr;
-        
+
         // init features
         state->feature.n_len = state->feature.data.size() / (state->feature.n_mel * state->feature.lfr_m);
         state->feature.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
@@ -922,13 +1000,11 @@ int sense_voice_batch_full(struct sense_voice_context *ctx, const sense_voice_fu
 
 int sense_voice_batch_pcmf(struct sense_voice_context *ctx, const sense_voice_full_params &params, std::vector<std::vector<float>> &pcmf32,
                            size_t max_batch_len, size_t max_batch_cnt,
-                           bool use_prefix, bool use_itn) 
-{
+                           bool use_prefix, bool use_itn) {
     // 还是要有ctx，重复生成会重复读取模型，有点耗性能
     // ctx中的参数需要在外面赋值，外面的参数形态各异，带不进来
     // pcmf32是vector<vecotr>，因此不需要split
-    for(size_t segmentID = 0; segmentID < pcmf32.size(); segmentID++)
-    {
+    for (size_t segmentID = 0; segmentID < pcmf32.size(); segmentID++) {
         sense_voice_segment pcmf_tmp;
         pcmf_tmp.t0 = pcmf_tmp.t1 = 0;
         pcmf_tmp.samples = pcmf32[segmentID];

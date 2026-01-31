@@ -16,6 +16,10 @@
 #include "tokenizers_cpp.h"
 #include <memory>
 
+#ifdef SENSE_VOICE_USE_COREML
+#include "coreml/sense-voice-encoder.h"
+#endif
+
 
 #ifdef __GNUC__
 #define SENSEVOICE_DEPRECATED(func, hint) func __attribute__((deprecated(hint)))
@@ -409,9 +413,11 @@ struct sense_voice_state {
 
     int lang_id = 0;  // english by default
 
+
+
     std::string path_model;  // populated by PARAFORMER_init_from_file()
-#ifdef USE_COREML
-    sense_voice_coreml_context *ctx_coreml = nullptr;
+#ifdef SENSE_VOICE_USE_COREML
+    struct sense_voice_coreml_context *ctx_coreml = nullptr;
 #endif
 
 
