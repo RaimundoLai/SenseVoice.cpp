@@ -306,6 +306,7 @@ struct sense_voice_segment {
     size_t t1;                   // 时间区间右端点
     // std::string text;         // tokens对应的文本
     std::vector<int> tokens;     // 识别后的tokens
+    std::vector<int> timestamps; // token frame index
     std::vector<float> samples;  // 具体音频
     // std::vector<float> 
     // bool speaker_turn_next;
@@ -404,6 +405,7 @@ struct sense_voice_state {
 
     // decode output (2-dimensional array: [n_tokens][n_vocab])
     std::vector<int> ids;
+    std::vector<int> token_timestamps;
     std::vector<sense_voice_segment> result_all;
     std::vector<size_t> segmentIDs;
     // std::vector<int> prompt_past;

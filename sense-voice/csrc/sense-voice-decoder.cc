@@ -580,10 +580,28 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
                 // Store result
                 if (state.result_all.empty()) {
                     state.ids = best_path;
+                    state.token_timestamps = decoder.GetBestTimes();
                 } else {
                     // Batch processing - fallback to greedy
                     state.ids.resize(argmax_logit->ne[0]);
                     ggml_backend_tensor_get(argmax_logit, state.ids.data(), 0, sizeof(int) * argmax_logit->ne[0]);
+                    // Fallback to greedy timestamps (currently beam search batching is not supported by WeNet this way)
+                    std::vector<int> raw_tokens(argmax_logit->ne[0]);
+                    ggml_backend_tensor_get(argmax_logit, raw_tokens.data(), 0, sizeof(int) * argmax_logit->ne[0]);
+                    
+                    int blank_id = 0;
+                    std::vector<int> fallback_times;
+                    int prev_token = -1;
+                    for (size_t i = 0; i < raw_tokens.size(); ++i) {
+                        int curr_token = raw_tokens[i];
+                        if (curr_token != prev_token) {
+                            if (curr_token != blank_id) {
+                                fallback_times.push_back(i);
+                            }
+                            prev_token = curr_token;
+                        }
+                    }
+                    state.token_timestamps = fallback_times;
                 }
             } else {
                 // === Greedy Decoding Path (Corrected) ===
@@ -596,7 +614,7 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
                 const int blank_id = 0; 
 
                 // CTC greedy decode: merge repeats and remove blanks
-                auto ctc_greedy_decode = [&](const std::vector<int>& raw, int start, int len) -> std::vector<int> {
+                auto ctc_greedy_decode = [&](const std::vector<int>& raw, int start, int len, std::vector<int>& out_times) -> std::vector<int> {
                     std::vector<int> result;
                     int prev_token = -1;
                     for (int i = 0; i < len; ++i) {
@@ -606,6 +624,7 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
                             // 2. Remove blanks
                             if (curr_token != blank_id) {
                                 result.push_back(curr_token);
+                                out_times.push_back(i); // Add corresponding frame index
                             }
                             prev_token = curr_token;
                         }
@@ -615,15 +634,17 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
 
                 if(state.result_all.empty()) {
                     // Single sentence case
-                    state.ids = ctc_greedy_decode(raw_tokens, 0, argmax_logit->ne[0]);
+                    state.token_timestamps.clear();
+                    state.ids = ctc_greedy_decode(raw_tokens, 0, argmax_logit->ne[0], state.token_timestamps);
                 }
                 else {
                     // Batch processing (multiple segments)
                     for(int32_t i = 0; i < argmax_logit->ne[1]; i++)
                     {
                         int posL = i * argmax_logit->ne[0];
+                        state.result_all[state.segmentIDs[i]].timestamps.clear();
                         state.result_all[state.segmentIDs[i]].tokens = 
-                            ctc_greedy_decode(raw_tokens, posL, argmax_logit->ne[0]);
+                            ctc_greedy_decode(raw_tokens, posL, argmax_logit->ne[0], state.result_all[state.segmentIDs[i]].timestamps);
                     }
                 }
             }
