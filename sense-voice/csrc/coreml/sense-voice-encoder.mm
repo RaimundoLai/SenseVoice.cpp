@@ -33,10 +33,14 @@ struct sense_voice_coreml_context * sense_voice_coreml_init(const char * path_mo
         }
 
         MLModelConfiguration * config = [[MLModelConfiguration alloc] init];
-        // Use All compute units to enable ANE/GPU if available
-        config.computeUnits = MLComputeUnitsAll;
+        // Use CPU + Neural Engine to avoid macOS 15 MPSGraph bytecode parsing bug.
+        // MLComputeUnitsAll includes the GPU/MPS path which generates broken bytecode
+        // for certain SenseVoice encoder operations on macOS 15 Sequoia, causing:
+        //   "error: attempting to parse a byte at the end of the bytecode"
+        // CPU + ANE still provides hardware acceleration via the Neural Engine.
+        config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
         
-        fprintf(stderr, "%s: loading CoreML model (All Compute Units)... \n", __func__);
+        fprintf(stderr, "%s: loading CoreML model (CPU + Neural Engine)... \n", __func__);
         
         // Re-initialize error for model loading
         error = nil;
@@ -172,6 +176,33 @@ void sense_voice_coreml_encode(
         // If output is float32
         if (outputArray.dataType == MLMultiArrayDataTypeFloat32) {
              memcpy(out, outputArray.dataPointer, outputArray.count * sizeof(float));
+        } else if (outputArray.dataType == MLMultiArrayDataTypeFloat16) {
+             uint16_t *f16_data = (uint16_t *)outputArray.dataPointer;
+             for (NSInteger i = 0; i < outputArray.count; i++) {
+                 uint16_t h = f16_data[i];
+                 uint32_t sign = (h >> 15) & 0x00000001;
+                 uint32_t exp  = (h >> 10) & 0x0000001f;
+                 uint32_t mant =  h        & 0x000003ff;
+
+                 exp = exp + (127 - 15);
+                 if (exp == 127 - 15) {
+                     if (mant == 0) {
+                         exp = 0;
+                     } else {
+                         exp++;
+                         while ((mant & 0x00000400) == 0) {
+                             mant <<= 1;
+                             exp--;
+                         }
+                         mant &= 0x000003ff;
+                     }
+                 } else if (exp == 127 - 15 + 31) {
+                     exp = 255;
+                 }
+
+                 uint32_t v = (sign << 31) | (exp << 23) | (mant << 13);
+                 memcpy(&out[i], &v, sizeof(float));
+             }
         } else {
              fprintf(stderr, "%s: unsupported output data type %ld\n", __func__, (long)outputArray.dataType);
         }

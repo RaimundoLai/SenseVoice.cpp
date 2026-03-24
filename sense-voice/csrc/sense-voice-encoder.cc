@@ -371,13 +371,14 @@ bool sense_voice_encode_internal(sense_voice_context &ctx,
 
 #ifdef SENSE_VOICE_USE_COREML
         if (state.ctx_coreml != nullptr) {
-            // CoreML model wraps only the encoder, expecting input that already has:
-            // 1. Embedding tokens prepended to features
-            // 2. Scaling by sqrt(n_encoder_hidden_state)
-            // 3. Position encoding added
+            // CoreML model was converted from self.model.encoder(speech, speech_lengths),
+            // which internally already does:
+            //   1. Scaling by sqrt(output_size)   (xs_pad *= self.output_size() ** 0.5)
+            //   2. Position encoding              (xs_pad = self.embed(xs_pad))
+            //   3. All encoder layers + norms
             //
-            // We need to prepare this combined input here since the CoreML model
-            // was converted from just the encoder part without embedding lookup.
+            // We only need to prepare the input with embedding tokens prepended to features,
+            // matching what SenseVoiceSmall.encode() does before calling self.encoder().
             
             const auto &hparams = ctx.model.hparams;
             const int n_feature_frames = state.feature.tensor->ne[1];  // number of feature frames
@@ -405,8 +406,6 @@ bool sense_voice_encode_internal(sense_voice_context &ctx,
                 int token_id = embedding_ids[i];
                 // Copy embedding vector for this token
                 for (int j = 0; j < feature_dim; j++) {
-                    // embed_weight is (feature_dim, n_vocab), so access as [j + token_id * embed_stride]
-                    // Actually ggml stores as contiguous row-major, so row token_id, col j
                     combined_input[i * feature_dim + j] = embed_data[token_id * embed_stride + j];
                 }
             }
@@ -421,26 +420,10 @@ bool sense_voice_encode_internal(sense_voice_context &ctx,
                 }
             }
             
-            // 5. Apply scaling: multiply by sqrt(n_encoder_hidden_state)
-            // Note: n_encoder_hidden_state is the hidden dimension (512), not feature_dim (560)
-            // This matches the ggml path at line 304
-            float scale = sqrtf((float)hparams.n_encoder_hidden_state);
-            for (size_t i = 0; i < combined_input.size(); i++) {
-                combined_input[i] *= scale;
-            }
+            // NOTE: Scaling and position encoding are NOT applied here because the
+            // CoreML model (SANMEncoderSV.forward) already handles them internally.
             
-            // 6. Add sinusoidal position encoding
-            // Position encoding has same shape as combined input: (feature_dim, n_total)
-            for (int t = 0; t < n_total; t++) {
-                int k = t + 1;  // position starts from 1
-                for (int i = 0; i < feature_dim / 2; i++) {
-                    float angle = k * powf(10000.0f, -2.0f * i / feature_dim);
-                    combined_input[t * feature_dim + i] += sinf(angle);
-                    combined_input[t * feature_dim + i + feature_dim / 2] += cosf(angle);
-                }
-            }
-            
-            // 7. Call CoreML encoder with prepared input
+            // 5. Call CoreML encoder with prepared input
             // CoreML expects: speech (1, n_total, feature_dim), speech_lengths (1)
             // Output: encoder_out which should match state.encoder_out dimensions
             sense_voice_coreml_encode(state.ctx_coreml, 
@@ -484,9 +467,9 @@ bool sense_voice_encode_internal(sense_voice_context &ctx,
             for (int b = 0; b < n_batch; b++)
                 for (int k = 1; k <= n_len; k++) {
                     for (int i = 0; i < dim / 2; i++) {
-                        _position[b * n_len * dim + (k - 1) * dim + i] = sinf(k * pow(10000, -2.0 * i / dim));
-                        _position[b * n_len * dim + (k - 1) * dim + i + dim / 2] =
-                                cosf(k * pow(10000, -2.0 * i / dim));
+                        float angle = k * expf(-logf(10000.0f) * i / (dim / 2.0f - 1.0f));
+                        _position[b * n_len * dim + (k - 1) * dim + i] = sinf(angle);
+                        _position[b * n_len * dim + (k - 1) * dim + i + dim / 2] = cosf(angle);
                     }
                 }
 
